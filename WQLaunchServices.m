@@ -1,0 +1,897 @@
+//
+//  WQLaunchServices.m
+//  WQ Files
+//  GPL-3.0-or-later.
+//
+
+#import "WQLaunchServices.h"
+#import "WQLocalization.h"
+#import "WQAccess.h"
+#import <stdlib.h>
+#import <string.h>
+#import <sys/stat.h>
+
+#pragma mark - App names from the LaunchServices database
+
+// LaunchServices' own API refuses this app on 27.x (OSStatus -54) and the app
+// bundles cannot be opened, but lsd keeps its database (CSStore2, magic
+// "bdsl") in an Internal Daemon container that we can read. In it, Bundle
+// records are 0x250 bytes long, preceded by [u32][u32 0x250]: +0x0c bundle
+// id, +0x6c bundle name, +0x74 display name, each a string reference
+// (string id << 2). Strings are stored as [u32 id][u32 length][UTF-8][NUL].
+// Names that exist only in localized form (most Apple apps) are not decoded;
+// the built-in table below covers those.
+
+static NSString *const kWQLSStoreKey = @"WQLaunchServicesStore";
+// When the database wasn't found: don't search again for a day (each search
+// lists every daemon container), unless the user refreshes.
+static NSString *const kWQLSMissKey = @"WQLaunchServicesStoreMissedAt";
+static const NSTimeInterval kWQLSMissRetry = 24 * 60 * 60;
+
+// These limits keep a malformed or unexpectedly large database from turning a
+// synchronous display-name lookup into an unbounded read/parse operation.
+static const size_t kWQLSMinStoreBytes = 0x1000;
+static const size_t kWQLSMaxStoreBytes = 64u * 1024u * 1024u;
+static const uint32_t kWQLSMaxStringID = 0x01000000u;
+static const NSUInteger kWQLSMaxBundleRecords = 100000;
+static const NSUInteger kWQLSMaxDecodedStrings = 200000;
+static const NSUInteger kWQLSMaxDecodedStringBytes = 8u * 1024u * 1024u;
+
+static NSObject *wq_ls_lock(void)
+{
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+// The regression tests still exercise discovery through the daemon list.
+#ifdef WQ_LS_TESTING
+static BOOL wq_ls_test_daemon_search = YES;
+#else
+static const BOOL wq_ls_test_daemon_search = NO;
+#endif
+
+static NSString *wq_find_ls_store(BOOL *searched);
+static BOOL wq_ls_candidate_info(NSString *path, struct stat *st);
+
+static BOOL wq_ls_stat_equal(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+        a->st_size == b->st_size &&
+        a->st_mtimespec.tv_sec == b->st_mtimespec.tv_sec &&
+        a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec;
+}
+
+static NSDictionary *wq_ls_signature(const struct stat *st)
+{
+    return @{
+        @"device": @(st->st_dev), @"inode": @(st->st_ino), @"size": @(st->st_size),
+        @"modifiedSeconds": @(st->st_mtimespec.tv_sec),
+        @"modifiedNanoseconds": @(st->st_mtimespec.tv_nsec)
+    };
+}
+
+static BOOL wq_ls_signature_equal(NSDictionary *a, NSDictionary *b)
+{
+    return a && b && [a isEqualToDictionary:b];
+}
+
+static NSString *wq_ls_error(NSString *path, NSString *reason)
+{
+    return [NSString stringWithFormat:@"%@ (%@)", path ?: @"<none>", reason ?: @"unknown error"];
+}
+
+static BOOL wq_ls_candidate_info(NSString *path, struct stat *st)
+{
+    if (!path.length || !wq_stat(path, st) || !S_ISREG(st->st_mode) ||
+        st->st_size < (off_t)kWQLSMinStoreBytes || st->st_size > (off_t)kWQLSMaxStoreBytes) {
+        return NO;
+    }
+    NSString *error = nil;
+    NSData *header = wq_read(path, 4, &error);
+    if (header.length != 4 || memcmp(header.bytes, "bdsl", 4) != 0) return NO;
+    return YES;
+}
+
+static BOOL wq_ls_is_newer(NSString *path, const struct stat *st,
+                           NSString *bestPath, const struct stat *best)
+{
+    if (!bestPath) return YES;
+    if (st->st_mtimespec.tv_sec != best->st_mtimespec.tv_sec)
+        return st->st_mtimespec.tv_sec > best->st_mtimespec.tv_sec;
+    if (st->st_mtimespec.tv_nsec != best->st_mtimespec.tv_nsec)
+        return st->st_mtimespec.tv_nsec > best->st_mtimespec.tv_nsec;
+    if (st->st_size != best->st_size) return st->st_size > best->st_size;
+    return [path compare:bestPath] == NSOrderedAscending;
+}
+
+static void wq_ls_consider_candidate(NSString *path, NSString **bestPath,
+                                      struct stat *best, NSMutableSet<NSString *> *seen)
+{
+    if (!path.length || [seen containsObject:path]) return;
+    [seen addObject:path];
+
+    struct stat st;
+    if (!wq_ls_candidate_info(path, &st)) return;
+    if (wq_ls_is_newer(path, &st, *bestPath, best)) {
+        *bestPath = path;
+        *best = st;
+    }
+}
+
+// *searched: the daemon containers were actually listed (a failed or cancelled
+// scan says nothing about whether the database exists).
+static NSString *wq_find_ls_store(BOOL *searched)
+{
+    if (searched) *searched = NO;
+    NSString *cached = [NSUserDefaults.standardUserDefaults stringForKey:kWQLSStoreKey];
+    NSString *bestPath = nil;
+    struct stat best = {0};
+    struct stat cachedStat;
+    BOOL cachedValid = cached.length && wq_ls_candidate_info(cached, &cachedStat);
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    if (cachedValid) wq_ls_consider_candidate(cached, &bestPath, &best, seen);
+
+    // Listing the daemon containers is a full id scan (minutes, and it asks
+    // first); the database is found by the container scan among the newest
+    // ids and remembered, so names only use the remembered location.
+    if (!wq_ls_test_daemon_search) {
+        if (searched) *searched = cachedValid;
+        return cachedValid ? cached : nil;
+    }
+    NSArray *daemons = wq_enumerate(@"/private/var/mobile/Containers/Data/InternalDaemon", 0, nil, nil);
+    if (daemons && searched) *searched = YES;
+    if (daemons) {
+        for (NSString *container in daemons) {
+            NSString *caches = [container stringByAppendingPathComponent:@"Library/Caches"];
+            NSArray *items = wq_list(caches, NULL);
+            for (NSString *name in [items sortedArrayUsingSelector:@selector(compare:)]) {
+                if (![name hasPrefix:@"com.apple.LaunchServices-"] || ![name hasSuffix:@".csstore"]) continue;
+                wq_ls_consider_candidate([caches stringByAppendingPathComponent:name], &bestPath, &best, seen);
+            }
+        }
+    }
+
+    // Keep a valid cached path usable if enumeration is temporarily unavailable.
+    if (!bestPath && cachedValid) {
+        bestPath = cached;
+    }
+    return bestPath;
+}
+
+// Record layouts by release. Offsets are from the record body (after the
+// 8-byte header). iOS 26 records are 0x14 bytes shorter, with the container
+// path and the fields after it 4 bytes earlier than on 27.0.
+typedef struct {
+    const char *label;
+    uint32_t bundleSize, bundleID, container, name, displayName, bundlePath;
+    uint32_t pluginSize, pluginBundleID, pluginContainer;
+} WQLSLayout;
+static const WQLSLayout kWQLSLayouts[] = {
+    { "27.0", 0x250, 0x0c, 0x68, 0x6c, 0x74, 0x00, 0x118, 0x00, 0x54 },
+    { "26",   0x23c, 0x0c, 0x64, 0x68, 0x70, 0x00, 0x104, 0x00, 0x50 },
+    // iOS 26.5 (from a device's layout hint, issue #37): same record sizes,
+    // container fields 4 bytes earlier than on 26.7. Whether the bundle id
+    // moved too isn't known, so both positions are tried.
+    { "26.5",  0x23c, 0x0c, 0x60, 0x64, 0x6c, 0x00, 0x104, 0x00, 0x4c },
+    { "26.5b", 0x23c, 0x08, 0x60, 0x64, 0x6c, 0x00, 0x104, 0x00, 0x4c },
+    // iOS 27.2 (from a device's layout hint): container fields 4 bytes later
+    // than on 27.0. Whether the bundle id moved too isn't known yet, so both
+    // positions are tried; the one that maps the most containers wins.
+    { "27.2", 0x25c, 0x0c, 0x6c, 0x70, 0x78, 0x00, 0x120, 0x00, 0x58 },
+    { "27.2b", 0x25c, 0x10, 0x6c, 0x70, 0x78, 0x00, 0x120, 0x04, 0x58 },
+    { "27.2c", 0x25c, 0x0c, 0x6c, 0x70, 0x78, 0x00, 0x120, 0x04, 0x58 },
+    { "27.2d", 0x25c, 0x10, 0x6c, 0x70, 0x78, 0x00, 0x120, 0x00, 0x58 },
+};
+static const size_t kWQLSLayoutCount = sizeof(kWQLSLayouts) / sizeof(kWQLSLayouts[0]);
+static const size_t kWQLSMaxRecordSize = 0x25c;
+
+static uint32_t wq_rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+
+static NSString *wq_cs_string(const uint8_t *b, size_t n, size_t o)
+{
+    if (o > n || n - o < 8) return nil;
+    uint32_t len = wq_rd32(b + o + 4);
+    // Strings are padded with zero bytes to a multiple of 4. One whose length
+    // is already a multiple of 4 has no terminator (container paths are 84 or
+    // 88 bytes), so only shorter ones must end in a zero byte. A string must
+    // still end before the buffer does.
+    if (len == 0 || len >= 0x800 || len >= n - o - 8 || (len % 4 && b[o + 8 + len] != 0)) return nil;
+    if (memchr(b + o + 8, 0, len)) return nil;
+    NSString *s = [[NSString alloc] initWithBytes:b + o + 8 length:len encoding:NSUTF8StringEncoding];
+    return s;
+}
+
+static BOOL wq_looks_like_bundle_id(NSString *s)
+{
+    static NSCharacterSet *bad;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bad = [[NSCharacterSet characterSetWithCharactersInString:
+                @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"] invertedSet];
+    });
+    return s.length > 2 && [s containsString:@"."] && ![s hasPrefix:@"."]
+        && [s rangeOfCharacterFromSet:bad].location == NSNotFound;
+}
+
+// Unicode format characters include bidi overrides/isolates, zero-width
+// characters, and BOM-like markers. They are replaced visibly while ordinary
+// international letters, accents, and scripts remain unchanged.
+static BOOL wq_is_name_format_scalar(uint32_t c)
+{
+    return c == 0x00ad || (c >= 0x0600 && c <= 0x0605) || c == 0x061c || c == 0x06dd ||
+        c == 0x070f || (c >= 0x0890 && c <= 0x0891) || c == 0x08e2 || c == 0x180e ||
+        (c >= 0x200b && c <= 0x200f) || (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x206f) || c == 0xfeff;
+}
+
+static NSString *wq_safe_name(NSString *value)
+{
+    if (!value.length) return nil;
+    NSMutableString *safe = [NSMutableString stringWithCapacity:value.length];
+    for (NSUInteger i = 0; i < value.length;) {
+        uint32_t scalar = [value characterAtIndex:i++];
+        if (scalar >= 0xd800 && scalar <= 0xdbff) {
+            if (i >= value.length) return nil;
+            unichar low = [value characterAtIndex:i++];
+            if (low < 0xdc00 || low > 0xdfff) return nil;
+            scalar = 0x10000u + ((scalar - 0xd800u) << 10) + (low - 0xdc00u);
+        } else if (scalar >= 0xdc00 && scalar <= 0xdfff) {
+            return nil;
+        }
+
+        if (wq_is_name_format_scalar(scalar) || scalar == 0x2028 || scalar == 0x2029) {
+            [safe appendString:@"\uFFFD"];
+        } else if (scalar <= 0xffff) {
+            [safe appendFormat:@"%C", (unichar)scalar];
+        } else {
+            scalar -= 0x10000u;
+            [safe appendFormat:@"%C%C", (unichar)(0xd800u + (scalar >> 10)),
+             (unichar)(0xdc00u + (scalar & 0x3ffu))];
+        }
+    }
+
+    NSString *normalized = [safe precomposedStringWithCanonicalMapping];
+    normalized = [normalized stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!normalized.length || [normalized hasPrefix:@"/"] || [normalized containsString:@".app/"]) return nil;
+    if ([normalized rangeOfCharacterFromSet:NSCharacterSet.controlCharacterSet].location != NSNotFound) return nil;
+    return normalized;
+}
+
+// Data container path -> bundle id. Apps: the Bundle record's +0x68 field;
+// extensions: 0x118-byte plugin records with the bundle id at +0x00 and the
+// path at +0x54. On iOS 27.2 the containers' identifier attribute can't be
+// read, so this is how their folders get a bundle id (and a name).
+static BOOL wq_is_data_container_path(NSString *path)
+{
+    static NSArray<NSString *> *prefixes;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        prefixes = @[@"/private/var/mobile/Containers/Data/Application/",
+                     @"/private/var/mobile/Containers/Data/PluginKitPlugin/"];
+    });
+    for (NSString *prefix in prefixes) {
+        if (![path hasPrefix:prefix] || path.length != prefix.length + 36) continue;
+        return [[NSUUID alloc] initWithUUIDString:[path substringFromIndex:prefix.length]] != nil;
+    }
+    return NO;
+}
+
+// Diagnostics: how many container paths the store holds, and which record
+// sizes and offsets refer to them. Only sizes and offsets are logged (no
+// names), so a Log from a release with a new layout shows where it moved.
+static int wq_u32_cmp(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+// String refs of the data container paths stored in the database, sorted;
+// independent of the record layout.
+static NSMutableData *wq_ls_container_path_refs(const uint8_t *b, size_t n)
+{
+    NSMutableData *refData = [NSMutableData new];
+    static const char needle[] = "/var/mobile/Containers/Data/";
+    const size_t needleLen = sizeof(needle) - 1;
+    const uint8_t *cursor = b, *end = b + n;
+    while (cursor < end) {
+        const uint8_t *hit = memmem(cursor, (size_t)(end - cursor), needle, needleLen);
+        if (!hit) break;
+        cursor = hit + needleLen;
+        const uint8_t *start = hit;
+        if ((size_t)(hit - b) >= 8 && memcmp(hit - 8, "/private", 8) == 0) start = hit - 8;
+        size_t o = (size_t)(start - b);
+        if (o < 8 || o % 4) continue;
+        uint32_t len = wq_rd32(start - 4);
+        if (len < needleLen || len > 0x100 || len > (size_t)(end - start)) continue;
+        uint32_t ref = wq_rd32(start - 8) << 2;
+        if (ref) [refData appendBytes:&ref length:sizeof(ref)];
+        if (refData.length / sizeof(uint32_t) >= 20000) break;
+    }
+    NSUInteger count = refData.length / sizeof(uint32_t);
+    if (count) qsort(refData.mutableBytes, count, sizeof(uint32_t), wq_u32_cmp);
+    return refData;
+}
+
+static void wq_ls_log_summary(const uint8_t *b, size_t n, NSString *layout, NSUInteger bundleRecords,
+                              NSUInteger pluginRecords, NSUInteger names, NSUInteger mapped)
+{
+    NSMutableData *refData = wq_ls_container_path_refs(b, n);
+    NSUInteger pathCount = refData.length / sizeof(uint32_t);
+    uint32_t *refs = refData.mutableBytes;
+    wq_log(@"names: store %.1f MB, layout %@: %lu bundle and %lu plugin records, %lu names, %lu of %lu container paths mapped",
+           n / 1048576.0, layout, (unsigned long)bundleRecords, (unsigned long)pluginRecords, (unsigned long)names,
+           (unsigned long)mapped, (unsigned long)pathCount);
+    if (!pathCount || mapped * 2 >= pathCount) return;
+
+    // Vote for (record size, offset of the container reference).
+    NSCountedSet<NSNumber *> *votes = [NSCountedSet new];
+    for (size_t q = 0; q + 4 <= n; q += 4) {
+        uint32_t v = wq_rd32(b + q);
+        if (!v || (v & 3) || !bsearch(&v, refs, pathCount, sizeof(uint32_t), wq_u32_cmp)) continue;
+        for (size_t k = 0; k < 0x400 && q >= 8 + k; k += 4) {
+            uint32_t size = wq_rd32(b + q - 8 - k + 4);
+            if (size >= 0x40 && size <= 0x800 && size % 4 == 0 && k < size)
+                [votes addObject:@((uint64_t)size << 16 | k)];
+        }
+    }
+    NSArray *top = [votes.allObjects sortedArrayUsingComparator:^NSComparisonResult(NSNumber *x, NSNumber *y) {
+        NSUInteger cx = [votes countForObject:x], cy = [votes countForObject:y];
+        return cx > cy ? NSOrderedAscending : cx < cy ? NSOrderedDescending : [x compare:y];
+    }];
+    NSMutableArray *parts = [NSMutableArray new];
+    for (NSNumber *key in [top subarrayWithRange:NSMakeRange(0, MIN(top.count, (NSUInteger)8))]) {
+        uint64_t value = key.unsignedLongLongValue;
+        [parts addObject:[NSString stringWithFormat:@"0x%llx@0x%llx x%lu", value >> 16, value & 0xffff,
+                          (unsigned long)[votes countForObject:key]]];
+    }
+    wq_log(@"names: layout hint (record size@container offset): %@", [parts componentsJoinedByString:@", "]);
+}
+
+static BOOL wq_parse_ls_store(NSData *data, NSDictionary **displayOut,
+                              NSDictionary **bundleNameOut, NSDictionary **containersOut,
+                              NSDictionary **bundlePathsOut)
+{
+    if (bundlePathsOut) *bundlePathsOut = nil;
+    if (displayOut) *displayOut = nil;
+    if (bundleNameOut) *bundleNameOut = nil;
+    if (containersOut) *containersOut = nil;
+
+    const uint8_t *b = data.bytes;
+    size_t n = data.length;
+    if (n < kWQLSMinStoreBytes || !b || memcmp(b, "bdsl", 4) != 0) {
+        wq_log(@"names: not a LaunchServices store");
+        return NO;
+    }
+    NSRange heapRange = [data rangeOfData:[NSData dataWithBytes:"<string>" length:8]
+                                  options:0 range:NSMakeRange(0, n)];
+    size_t heap = heapRange.location == NSNotFound ? 0 : heapRange.location;
+
+    // Pass 1: Bundle and plug-in records of every known layout, and which
+    // string ids they need. The layout that maps the most containers wins.
+    const uint32_t kIDs = kWQLSMaxStringID;
+    size_t bitsetBytes = kIDs / 8;
+    uint8_t *need = calloc(bitsetBytes, 1), *inHeap = calloc(bitsetBytes, 1);
+    NSMutableArray<NSMutableData *> *layoutRecs = [NSMutableArray new], *layoutPlugins = [NSMutableArray new];
+    for (size_t l = 0; l < kWQLSLayoutCount; l++) {
+        [layoutRecs addObject:[NSMutableData new]];
+        [layoutPlugins addObject:[NSMutableData new]];   // pairs: bundle id ref, container path ref
+    }
+    if (!need || !inHeap) {
+        free(need);
+        free(inHeap);
+        wq_log(@"names: LaunchServices parser allocation failed");
+        return NO;
+    }
+
+    BOOL tooManyRecords = NO;
+    for (size_t o = 0; o + 8 + kWQLSMaxRecordSize <= n && !tooManyRecords; o += 4) {
+        uint32_t size = wq_rd32(b + o + 4);
+        const uint8_t *u = b + o + 8;
+        for (size_t l = 0; l < kWQLSLayoutCount; l++) {
+            const WQLSLayout *L = &kWQLSLayouts[l];
+            if (size == L->pluginSize) {
+                NSMutableData *plugins = layoutPlugins[l];
+                uint32_t p[2] = { wq_rd32(u + L->pluginBundleID), wq_rd32(u + L->pluginContainer) };
+                if (p[0] && !(p[0] & 3) && (p[0] >> 2) < kIDs && p[1] && !(p[1] & 3) && (p[1] >> 2) < kIDs &&
+                    plugins.length / sizeof(p) < kWQLSMaxBundleRecords) {
+                    [plugins appendBytes:p length:sizeof(p)];
+                    for (int i = 0; i < 2; i++) need[(p[i] >> 2) / 8] |= 1 << ((p[i] >> 2) % 8);
+                }
+            }
+            if (size != L->bundleSize) continue;
+            NSMutableData *recs = layoutRecs[l];
+            if (recs.length / (5 * sizeof(uint32_t)) >= kWQLSMaxBundleRecords) {
+                tooManyRecords = YES;
+                break;
+            }
+            uint32_t r[5] = { wq_rd32(u + L->bundleID), wq_rd32(u + L->name), wq_rd32(u + L->displayName), wq_rd32(u + L->container),
+                              wq_rd32(u + L->bundlePath) };
+            if (!r[0] || (r[0] & 3) || (r[0] >> 2) >= kIDs) continue;
+            [recs appendBytes:r length:sizeof(r)];
+            for (int i = 0; i < 5; i++) {
+                if (r[i] && !(r[i] & 3) && (r[i] >> 2) < kIDs)
+                    need[(r[i] >> 2) / 8] |= 1 << ((r[i] >> 2) % 8);
+            }
+        }
+    }
+    if (tooManyRecords) {
+        free(need);
+        free(inHeap);
+        wq_log(@"names: LaunchServices store exceeds record limit");
+        return NO;
+    }
+
+    // Pass 2: the strings, preferring copies inside the string table. On
+    // iOS 26 container paths live in a second table whose ids overlap the
+    // string table's, so path-shaped strings are also kept by id on their own
+    // (an id with two different paths is unusable).
+    NSMutableDictionary<NSNumber *, NSString *> *strings = [NSMutableDictionary new];
+    NSMutableDictionary<NSNumber *, id> *pathStrings = [NSMutableDictionary new];
+    NSMutableDictionary<NSNumber *, id> *appPathStrings = [NSMutableDictionary new];
+    NSUInteger decodedStringBytes = 0;
+    BOOL tooManyStrings = NO;
+    for (size_t o = 0; o <= n - 8; o += 4) {
+        uint32_t sid = wq_rd32(b + o);
+        if (!sid || sid >= kIDs || !(need[sid / 8] & (1 << (sid % 8)))) continue;
+        BOOL here = o >= heap, had = strings[@(sid)] != nil;
+        BOOL keepGeneral = !had || (here && !(inHeap[sid / 8] & (1 << (sid % 8))));
+        uint32_t peekLen = o + 8 <= n ? wq_rd32(b + o + 4) : 0;
+        BOOL maybePath = peekLen >= 6 && peekLen < 0x400 && o + 8 < n && b[o + 8] == '/';
+        if (!keepGeneral && !maybePath) continue;
+        NSString *s = wq_cs_string(b, n, o);
+        if (!s) continue;
+        if (maybePath) {
+            NSMutableDictionary *table = [s containsString:@"/mobile/Containers/Data/"] ? pathStrings
+                : ([s hasSuffix:@".app"] || [s hasSuffix:@".app/"]) ? appPathStrings : nil;
+            id previous = table[@(sid)];
+            if (table && !previous) table[@(sid)] = s;
+            else if (table && ![previous isEqual:s]) table[@(sid)] = NSNull.null;
+        }
+        if (!keepGeneral) continue;
+        if (!had && (strings.count >= kWQLSMaxDecodedStrings ||
+                     s.length > kWQLSMaxDecodedStringBytes - decodedStringBytes)) {
+            tooManyStrings = YES;
+            break;
+        }
+        strings[@(sid)] = s;
+        if (!had) decodedStringBytes += s.length;
+        if (here) inHeap[sid / 8] |= 1 << (sid % 8);
+    }
+    free(need);
+    free(inHeap);
+    if (tooManyStrings) {
+        wq_log(@"names: LaunchServices store exceeds string limit");
+        return NO;
+    }
+    NSUInteger anyRecords = 0, anyPlugins = 0;
+    for (size_t l = 0; l < kWQLSLayoutCount; l++) {
+        anyRecords += layoutRecs[l].length / (5 * sizeof(uint32_t));
+        anyPlugins += layoutPlugins[l].length / (2 * sizeof(uint32_t));
+    }
+    if (!anyRecords) {
+        wq_ls_log_summary(b, n, @"none", 0, anyPlugins, 0, 0);
+        wq_log(@"names: LaunchServices store contains no bundle records");
+        return NO;
+    }
+
+    NSString *(^pathFor)(uint32_t) = ^NSString *(uint32_t ref) {
+        id path = pathStrings[@(ref >> 2)];
+        if (path == NSNull.null) return nil;
+        return path ?: strings[@(ref >> 2)];
+    };
+    NSDictionary *display = nil, *bundleName = nil, *containers = nil, *bundlePaths = nil;
+    size_t chosen = 0;
+    for (size_t l = 0; l < kWQLSLayoutCount; l++) {
+        NSMutableDictionary *layoutDisplay = [NSMutableDictionary new], *layoutBundleName = [NSMutableDictionary new];
+        NSMutableDictionary *layoutBundlePaths = [NSMutableDictionary new];
+        NSMutableDictionary<NSString *, id> *layoutContainers = [NSMutableDictionary new];
+        // A path claimed by two different bundle ids is left out rather than guessed.
+        // Plug-in records only claim extension containers and bundle records
+        // only app containers, so a record type that happens to share a size
+        // can't knock out the other table's paths.
+        void (^claim)(NSString *, NSString *, NSString *) = ^(NSString *path, NSString *bid, NSString *kind) {
+            // iOS 26 stores container paths with a trailing slash; lookups
+            // use the /private/var form without one.
+            if ([path hasSuffix:@"/"]) path = [path substringToIndex:path.length - 1];
+            if ([path hasPrefix:@"/var/"]) path = [@"/private" stringByAppendingString:path];
+            if (!wq_is_data_container_path(path) || !wq_looks_like_bundle_id(bid) || ![path containsString:kind]) return;
+            id known = layoutContainers[path];
+            if (!known) layoutContainers[path] = bid;
+            else if (![known isEqual:bid]) layoutContainers[path] = NSNull.null;
+        };
+        NSData *plugins = layoutPlugins[l], *recs = layoutRecs[l];
+        const uint32_t *pr = plugins.bytes;
+        for (NSUInteger i = 0; i < plugins.length / sizeof(uint32_t); i += 2)
+            claim(pathFor(pr[i + 1]), strings[@(pr[i] >> 2)], @"/Data/PluginKitPlugin/");
+        const uint32_t *r = recs.bytes;
+        for (NSUInteger i = 0; i < recs.length / sizeof(uint32_t); i += 5) {
+            NSString *bid = strings[@(r[i] >> 2)];
+            if (!wq_looks_like_bundle_id(bid)) continue;
+            if (r[i + 3] && !(r[i + 3] & 3)) claim(pathFor(r[i + 3]), bid, @"/Data/Application/");
+            NSString *nm = (r[i + 1] & 3) ? nil : strings[@(r[i + 1] >> 2)];
+            NSString *dn = (r[i + 2] & 3) ? nil : strings[@(r[i + 2] >> 2)];
+            NSString *safeDisplay = wq_safe_name(dn);
+            NSString *safeBundleName = wq_safe_name(nm);
+            if (safeDisplay && !layoutDisplay[bid]) layoutDisplay[bid] = safeDisplay;
+            if (safeBundleName && !layoutBundleName[bid]) layoutBundleName[bid] = safeBundleName;
+            id appPath = (r[i + 4] && !(r[i + 4] & 3)) ? appPathStrings[@(r[i + 4] >> 2)] : nil;
+            if ([appPath isKindOfClass:NSString.class] && !layoutBundlePaths[bid]) {
+                NSString *clean = [appPath hasSuffix:@"/"] ? [appPath substringToIndex:[appPath length] - 1] : appPath;
+                if ([clean hasPrefix:@"/var/"]) clean = [@"/private" stringByAppendingString:clean];
+                layoutBundlePaths[bid] = clean;
+            }
+        }
+        for (NSString *path in layoutContainers.allKeys)
+            if (layoutContainers[path] == NSNull.null) [layoutContainers removeObjectForKey:path];
+        if (!containers || layoutContainers.count > containers.count ||
+            (layoutContainers.count == containers.count && layoutDisplay.count > display.count)) {
+            display = layoutDisplay;
+            bundleName = layoutBundleName;
+            bundlePaths = layoutBundlePaths;
+            containers = layoutContainers;
+            chosen = l;
+        }
+    }
+    // A few Apple apps' names, to check the name fields of a new layout.
+    NSMutableArray *samples = [NSMutableArray new];
+    for (NSString *bid in @[@"com.apple.mobilesafari", @"com.apple.Preferences", @"com.apple.camera", @"com.apple.mobilenotes"]) {
+        NSString *name = display[bid] ?: bundleName[bid];
+        if (name) [samples addObject:[NSString stringWithFormat:@"%@ = %@", bid, name]];
+    }
+    // The container scan and the name loader each parse the same store; log
+    // its summary once per distinct result, not once per parse.
+    static NSString *lastSummary;
+    NSString *summary = [NSString stringWithFormat:@"%zu %zu %lu %lu", n, chosen, (unsigned long)display.count,
+                         (unsigned long)containers.count];
+    BOOL newSummary;
+    @synchronized (NSObject.class) {
+        newSummary = ![summary isEqualToString:lastSummary];
+        if (newSummary) lastSummary = summary;
+    }
+    if (newSummary && samples.count) wq_log(@"names: sample: %@", [samples componentsJoinedByString:@", "]);
+    if (newSummary) wq_ls_log_summary(b, n, @(kWQLSLayouts[chosen].label), layoutRecs[chosen].length / (5 * sizeof(uint32_t)),
+                      layoutPlugins[chosen].length / (2 * sizeof(uint32_t)), display.count, containers.count);
+    // A layout that maps only a small part of the container paths in the store
+    // is the wrong one (its names are wrong too): don't use the store at all,
+    // so the app list falls back to the scan instead of showing a few apps.
+    NSUInteger storePaths = wq_ls_container_path_refs(b, n).length / sizeof(uint32_t);
+    if (storePaths >= 20 && containers.count * 2 < storePaths) {
+        if (newSummary)
+            wq_log(@"names: layout %s maps only %lu of %lu container paths; this iOS version's database layout isn't known, so it isn't used",
+                   kWQLSLayouts[chosen].label, (unsigned long)containers.count, (unsigned long)storePaths);
+        return NO;
+    }
+    if (bundlePathsOut) *bundlePathsOut = [bundlePaths copy];
+    if (displayOut) *displayOut = [display copy];
+    if (bundleNameOut) *bundleNameOut = [bundleName copy];
+    if (containersOut) *containersOut = [containers copy];
+    return YES;
+}
+
+static NSDictionary *gLSDisplay;
+static NSDictionary *gLSBundleName;
+static NSDictionary *gLSContainers;
+static NSDictionary *gLSBundlePaths;
+static NSString *gLSStorePath;
+static NSDictionary *gLSStoreSignature;
+static BOOL gLSLoaded;
+static NSUInteger gLSFailureCount;
+static NSTimeInterval gLSNextRetryAt;
+
+static void wq_ls_clear_snapshot_if_changed(BOOL changed)
+{
+    if (!changed) return;
+    gLSDisplay = nil;
+    gLSBundleName = nil;
+    gLSContainers = nil;
+    gLSBundlePaths = nil;
+    gLSStorePath = nil;
+    gLSStoreSignature = nil;
+    gLSLoaded = NO;
+}
+
+static void wq_ls_note_failure(NSTimeInterval now, NSString *reason)
+{
+    gLSFailureCount = MIN(gLSFailureCount + 1, (NSUInteger)6);
+    NSUInteger shift = gLSFailureCount > 1 ? gLSFailureCount - 1 : 0;
+    NSTimeInterval delay = (NSTimeInterval)(1u << MIN(shift, (NSUInteger)5));
+    gLSNextRetryAt = now + delay;
+    if (reason) wq_log(@"names: %@; retrying in %.0f s", reason, delay);
+}
+
+static void wq_load_ls_names_locked(void)
+{
+    NSTimeInterval now = NSDate.date.timeIntervalSinceReferenceDate;
+    BOOL currentChanged = NO;
+    if (gLSLoaded && gLSStorePath) {
+        struct stat current;
+        if (wq_ls_candidate_info(gLSStorePath, &current)) {
+            NSDictionary *signature = wq_ls_signature(&current);
+            currentChanged = !wq_ls_signature_equal(signature, gLSStoreSignature);
+            if (!currentChanged) return;
+        } else {
+            currentChanged = YES;
+        }
+    } else if (!gLSLoaded && now < gLSNextRetryAt) {
+        return;
+    } else if (!gLSLoaded && ![NSUserDefaults.standardUserDefaults stringForKey:kWQLSStoreKey].length) {
+        NSDate *missed = [NSUserDefaults.standardUserDefaults objectForKey:kWQLSMissKey];
+        if ([missed isKindOfClass:NSDate.class] && now - missed.timeIntervalSinceReferenceDate < kWQLSMissRetry &&
+            now >= missed.timeIntervalSinceReferenceDate) {
+            gLSNextRetryAt = missed.timeIntervalSinceReferenceDate + kWQLSMissRetry;
+            return;
+        }
+    }
+
+    BOOL hadLocation = [NSUserDefaults.standardUserDefaults stringForKey:kWQLSStoreKey].length > 0;
+    BOOL searched = NO;
+    NSString *path = wq_find_ls_store(&searched);
+    if (!path) {
+        wq_ls_clear_snapshot_if_changed(currentChanged);
+        if (!hadLocation && searched) {
+            // Never found, after a complete search: wait a day (or a refresh).
+            [NSUserDefaults.standardUserDefaults setObject:NSDate.date forKey:kWQLSMissKey];
+            gLSNextRetryAt = now + kWQLSMissRetry;
+            wq_log(@"names: LaunchServices database not found; searching again in a day or on refresh");
+        } else {
+            // A known database that's briefly unreadable, or a scan that failed.
+            wq_ls_note_failure(now, @"LaunchServices database not found");
+        }
+        return;
+    }
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:kWQLSMissKey];
+
+    struct stat before;
+    if (!wq_ls_candidate_info(path, &before)) {
+        wq_ls_clear_snapshot_if_changed(currentChanged);
+        wq_ls_note_failure(now, wq_ls_error(path, @"candidate is no longer valid"));
+        return;
+    }
+    NSDictionary *beforeSignature = wq_ls_signature(&before);
+    BOOL snapshotChanged = !gLSLoaded || ![path isEqualToString:gLSStorePath] ||
+        !wq_ls_signature_equal(beforeSignature, gLSStoreSignature);
+    if (gLSLoaded && [path isEqualToString:gLSStorePath] &&
+        wq_ls_signature_equal(beforeSignature, gLSStoreSignature)) {
+        gLSFailureCount = 0;
+        gLSNextRetryAt = 0;
+        return;
+    }
+
+    NSString *error = nil;
+    NSData *data = wq_read(path, kWQLSMaxStoreBytes + 1, &error);
+    if (!data || data.length > kWQLSMaxStoreBytes) {
+        wq_ls_clear_snapshot_if_changed(snapshotChanged);
+        wq_ls_note_failure(now, wq_ls_error(path, error ?: @"store exceeds size limit"));
+        return;
+    }
+
+    NSDictionary *display = nil, *bundleName = nil, *containers = nil, *bundlePaths = nil;
+    if (!wq_parse_ls_store(data, &display, &bundleName, &containers, &bundlePaths)) {
+        wq_ls_clear_snapshot_if_changed(snapshotChanged);
+        wq_ls_note_failure(now, wq_ls_error(path, @"store rejected by bounded parser"));
+        return;
+    }
+
+    // Do not publish a snapshot that was changed while it was being read or parsed.
+    struct stat after;
+    if (!wq_ls_candidate_info(path, &after) || !wq_ls_stat_equal(&before, &after)) {
+        wq_ls_clear_snapshot_if_changed(snapshotChanged);
+        wq_ls_note_failure(now, wq_ls_error(path, @"store changed during read"));
+        return;
+    }
+
+    // Dictionaries are immutable copies and are assigned only after a complete,
+    // validated parse. Readers therefore see either the previous snapshot or this one.
+    gLSDisplay = [display copy] ?: @{};
+    gLSBundleName = [bundleName copy] ?: @{};
+    gLSContainers = [containers copy] ?: @{};
+    gLSBundlePaths = [bundlePaths copy] ?: @{};
+    gLSStorePath = [path copy];
+    gLSStoreSignature = [beforeSignature copy];
+    gLSLoaded = YES;
+    gLSFailureCount = 0;
+    gLSNextRetryAt = 0;
+    [NSUserDefaults.standardUserDefaults setObject:gLSStorePath forKey:kWQLSStoreKey];
+}
+
+// Apple's own apps and services: LaunchServices refuses this app on 27.x
+// (OSStatus -54) and /Applications is not listable, so names come from here.
+static NSDictionary<NSString *, NSString *> *wq_builtin_names(void)
+{
+    static NSDictionary *names;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        names = @{
+            @"com.apple.AppStore": @"App Store", @"com.apple.mobilesafari": @"Safari", @"com.apple.weather": @"Weather",
+            @"com.apple.news": @"News", @"com.apple.stocks": @"Stocks", @"com.apple.mobilemail": @"Mail",
+            @"com.apple.MobileSMS": @"Messages", @"com.apple.mobilephone": @"Phone", @"com.apple.mobileslideshow": @"Photos",
+            @"com.apple.camera": @"Camera", @"com.apple.mobilecal": @"Calendar", @"com.apple.mobilenotes": @"Notes",
+            @"com.apple.reminders": @"Reminders", @"com.apple.Maps": @"Maps", @"com.apple.Music": @"Music",
+            @"com.apple.tv": @"TV", @"com.apple.podcasts": @"Podcasts", @"com.apple.iBooks": @"Books",
+            @"com.apple.Health": @"Health", @"com.apple.Passbook": @"Wallet", @"com.apple.Preferences": @"Settings",
+            @"com.apple.mobiletimer": @"Clock", @"com.apple.calculator": @"Calculator", @"com.apple.compass": @"Compass",
+            @"com.apple.VoiceMemos": @"Voice Memos", @"com.apple.facetime": @"FaceTime", @"com.apple.MobileAddressBook": @"Contacts",
+            @"com.apple.DocumentsApp": @"Files", @"com.apple.findmy": @"Find My", @"com.apple.Home": @"Home",
+            @"com.apple.shortcuts": @"Shortcuts", @"com.apple.Translate": @"Translate", @"com.apple.Fitness": @"Fitness",
+            @"com.apple.Bridge": @"Watch", @"com.apple.freeform": @"Freeform", @"com.apple.journal": @"Journal",
+            @"com.apple.Passwords": @"Passwords", @"com.apple.measure": @"Measure", @"com.apple.Magnifier": @"Magnifier",
+            @"com.apple.tips": @"Tips", @"com.apple.siri": @"Siri", @"com.apple.games": @"Games", @"com.apple.gamecenter": @"Game Center",
+            @"com.apple.Image-Playground": @"Image Playground", @"com.apple.Photos": @"Photos", @"com.apple.Keynote": @"Keynote",
+            @"com.apple.Pages": @"Pages", @"com.apple.Numbers": @"Numbers", @"com.apple.mobileme.fmip1": @"Find iPhone",
+            @"com.apple.store.Jolly": @"Apple Store", @"com.apple.supportapp": @"Apple Support", @"com.apple.Diagnostics": @"Diagnostics",
+            @"com.apple.PosterBoard": @"Wallpaper", @"com.apple.MercuryPoster": @"Wallpaper (Mercury)",
+            @"com.apple.WallpaperKit.CollectionsPoster": @"Wallpaper Collections",
+            @"com.apple.PhotosUIPrivate.PhotosPosterProvider": @"Photo Wallpaper",
+            @"com.apple.chrono.WidgetRenderer-Default": @"Widgets", @"com.apple.ScreenshotServicesService": @"Screenshots",
+            @"com.apple.Sharing.AirDrop": @"AirDrop", @"com.apple.AppleMediaServicesUI": @"Apple Media Services",
+            @"com.apple.AppleMediaServices": @"Apple Media Services", @"com.apple.ClarityCamera": @"Assistive Access Camera",
+            @"com.apple.ClarityPhotos": @"Assistive Access Photos", @"com.apple.SystemVoiceAssistant": @"Voice Assistant",
+            @"com.apple.ShazamEventsApp": @"Shazam", @"com.apple.ScreenTimeWidgetApplication": @"Screen Time",
+            @"com.apple.CBRemoteSetup": @"Remote Setup", @"com.apple.DemoApp": @"Demo", @"com.apple.AAUIViewService": @"Apple Account",
+            @"com.apple.AccountAuthenticationDialog": @"Account Sign-In", @"com.apple.StoreKitUISceneService": @"App Store Sheets",
+            @"com.apple.NewDeviceOutreachApp": @"New Device Setup", @"com.apple.PDUIApp": @"Printing", @"com.apple.EventViewService": @"Events",
+            @"com.apple.MXUIService": @"Media Picker", @"com.apple.ctkui": @"Smart Card", @"com.apple.InCallService": @"Call Screen",
+            @"com.apple.springboard": @"SpringBoard", @"com.apple.SafariViewService": @"Safari View", @"com.apple.mobilesms.compose": @"Message Compose",
+            @"com.apple.CompanionViewService": @"Companion", @"com.apple.musicrecognition": @"Music Recognition",
+            @"com.apple.FontInstallViewService": @"Font Install", @"com.apple.CMViewSrvc": @"Continuity Markup",
+            @"com.apple.AppleCashStickerPackHost": @"Apple Cash Stickers", @"com.apple.TVSetupUIService": @"Apple TV Setup",
+            @"com.apple.HearingApp": @"Hearing", @"com.apple.CompanionSetup": @"Companion Setup",
+            @"com.apple.CarPlayWallpaper": @"CarPlay Wallpaper", @"com.apple.CloudKit.ShareBear": @"iCloud Sharing",
+            @"com.apple.EnhancedLogging": @"Enhanced Logging", @"com.apple.tcc.AuthorizationPromptService": @"Privacy Prompts",
+            @"com.apple.WebContentFilter.remoteUI.WebContentAnalysisUI": @"Content Filter",
+            @"com.apple.SystemPaperViewService": @"Quick Note", @"com.apple.HeadphoneProxService": @"Headphones",
+            @"com.apple.datadetectors.DDActionsService": @"Data Detectors", @"com.apple.ServicesPaymentAngel": @"Apple Pay",
+            @"com.apple.HomeCaptiveViewService": @"Wi-Fi Login", @"com.apple.DiagnosticsService": @"Diagnostics",
+            @"com.apple.CarTirePressure": @"Tire Pressure", @"com.apple.FCAuthenticationUI": @"Authentication",
+            @"com.apple.icloud.FindMyDevice.FindMyExtensionContainer": @"Find My",
+            @"com.apple.messages.RemoteAlerts": @"Messages Alerts",
+            @"com.apple.AccessoryNotifications.SourceSelection": @"Accessory Source",
+            @"com.apple.printcenter": @"Print Center", @"com.apple.BarcodeScanner": @"Code Scanner",
+            @"com.apple.chrono.WidgetRenderer-Snapshots": @"Widget Snapshots",
+            @"com.apple.AMSEngagementViewService": @"Apple Media Services",
+            @"com.apple.appManagedFeatures.Restrictions": @"Restrictions", @"com.apple.CarRadio": @"Car Radio",
+            @"com.apple.PassbookUIService": @"Wallet Sheets", @"com.apple.Spotlight": @"Spotlight", @"com.apple.InputUI": @"Keyboard",
+        };
+    });
+    return names;
+}
+
+static NSString *wq_known_name_locked(NSString *bundleID)
+{
+    wq_load_ls_names_locked();
+    return gLSDisplay[bundleID] ?: wq_builtin_names()[bundleID] ?: gLSBundleName[bundleID];
+}
+
+BOOL wq_display_names_loaded(void)
+{
+    @synchronized (wq_ls_lock()) { return gLSLoaded; }
+}
+
+void wq_load_display_names(void)
+{
+    @synchronized (wq_ls_lock()) { wq_load_ls_names_locked(); }
+}
+
+void wq_display_names_reset_miss(void)
+{
+    @synchronized (wq_ls_lock()) {
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:kWQLSMissKey];
+        gLSNextRetryAt = 0;
+        gLSFailureCount = 0;
+    }
+}
+
+static NSString *const kWQBundleContainerRoot = @"/private/var/containers/Bundle/Application/";
+
+// App bundle containers (<root>/<UUID>, holding Name.app) -> bundle id, built
+// from the bundle paths; rebuilt when a new database snapshot is published.
+static NSDictionary<NSString *, NSString *> *wq_bundle_containers_locked(void)
+{
+    static NSDictionary *source, *map;
+    wq_load_ls_names_locked();
+    if (map && source == gLSBundlePaths) return map;
+    NSMutableDictionary *built = [NSMutableDictionary new];
+    [gLSBundlePaths enumerateKeysAndObjectsUsingBlock:^(NSString *bid, NSString *path, BOOL *__unused stop) {
+        if (![bid isKindOfClass:NSString.class] || ![path isKindOfClass:NSString.class]) return;
+        NSString *app = path.stringByStandardizingPath;
+        if ([app hasPrefix:@"/var/"]) app = [@"/private" stringByAppendingString:app];
+        if (![app hasPrefix:kWQBundleContainerRoot] || ![app.pathExtension isEqualToString:@"app"]) return;
+        NSString *container = app.stringByDeletingLastPathComponent;
+        // Only <root>/<UUID>/Name.app: extensions and nested apps stay out.
+        if (![container.stringByDeletingLastPathComponent isEqualToString:
+              [kWQBundleContainerRoot substringToIndex:kWQBundleContainerRoot.length - 1]]) return;
+        if (!built[container] || bid.length < [built[container] length]) built[container] = bid;
+    }];
+    source = gLSBundlePaths;
+    map = [built copy];
+    return map;
+}
+
+NSString *wq_bundle_id_for_container(NSString *path)
+{
+    if (!path.length) return nil;
+    NSString *key = path.stringByStandardizingPath;
+    if ([key hasPrefix:@"/var/"]) key = [@"/private" stringByAppendingString:key];
+    @synchronized (wq_ls_lock()) {
+        wq_load_ls_names_locked();
+        NSString *bid = gLSContainers[key];
+        if (!bid && [key hasPrefix:kWQBundleContainerRoot]) bid = wq_bundle_containers_locked()[key];
+        return [bid isKindOfClass:NSString.class] ? bid : nil;
+    }
+}
+
+NSArray<NSString *> *wq_ls_bundle_containers(void)
+{
+    @synchronized (wq_ls_lock()) {
+        return [wq_bundle_containers_locked().allKeys sortedArrayUsingSelector:@selector(compare:)];
+    }
+}
+
+NSString *wq_display_name(NSString *bundleID)
+{
+    if (!bundleID) return nil;
+    @synchronized (wq_ls_lock()) {
+        NSString *name = wq_known_name_locked(bundleID);
+        if (name) return WQLocalized(name);
+        // Unknown id: use the closest parent app (com.apple.news.widget -> News).
+        NSArray *parts = [bundleID componentsSeparatedByString:@"."];
+        for (NSInteger n = (NSInteger)parts.count - 1; n >= 2; n--) {
+            NSString *prefix = [[parts subarrayWithRange:NSMakeRange(0, (NSUInteger)n)] componentsJoinedByString:@"."];
+            NSString *parent = wq_known_name_locked(prefix);
+            if (parent) {
+                NSString *suffix = wq_safe_name(parts.lastObject);
+                NSString *display = suffix.length ? [NSString stringWithFormat:@"%@ \u2013 %@", parent, suffix] : parent;
+                return WQLocalized(display);
+            }
+        }
+        return nil;
+    }
+}
+
+NSArray<NSString *> *wq_ls_container_paths(NSString *storeHint)
+{
+    // No lock and no scan here: the container scan calls this while a name
+    // load may be waiting for that scan.
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *path = storeHint.length ? storeHint : [defaults stringForKey:kWQLSStoreKey];
+    if (!path.length) return nil;
+    NSString *error = nil;
+    NSData *data = wq_read(path, kWQLSMaxStoreBytes + 1, &error);
+    if (!data || data.length > kWQLSMaxStoreBytes) {
+        wq_log(@"names: cannot read %@ (%@)", path, error ?: @"too large");
+        return nil;
+    }
+    NSDictionary *containers = nil;
+    if (!wq_parse_ls_store(data, NULL, NULL, &containers, NULL) || containers.count < 2) return nil;
+    if (storeHint.length) {
+        [defaults setObject:storeHint forKey:kWQLSStoreKey];
+        [defaults removeObjectForKey:kWQLSMissKey];
+    }
+    // App group containers aren't mapped to an owner here; the store lists
+    // the group containers of installed apps, which is what the list needs.
+    NSMutableSet<NSString *> *all = [NSMutableSet setWithArray:containers.allKeys];
+    static const char needle[] = "/mobile/Containers/Shared/AppGroup/";
+    const uint8_t *bytes = data.bytes, *cursor = bytes, *end = bytes + data.length;
+    while (cursor < end) {
+        const uint8_t *hit = memmem(cursor, (size_t)(end - cursor), needle, sizeof(needle) - 1);
+        if (!hit) break;
+        cursor = hit + sizeof(needle) - 1;
+        if ((size_t)(end - cursor) < 36) break;
+        NSString *uuid = [[NSString alloc] initWithBytes:cursor length:36 encoding:NSASCIIStringEncoding];
+        if (!uuid || ![[NSUUID alloc] initWithUUIDString:uuid]) continue;
+        [all addObject:[@"/private/var/mobile/Containers/Shared/AppGroup/" stringByAppendingString:uuid.uppercaseString]];
+    }
+    return all.allObjects;
+}
+
+NSString *wq_bundle_path_for_id(NSString *bundleID)
+{
+    if (!bundleID.length) return nil;
+    @synchronized (wq_ls_lock()) {
+        wq_load_ls_names_locked();
+        NSString *path = gLSBundlePaths[bundleID];
+        return [path isKindOfClass:NSString.class] ? path : nil;
+    }
+}
