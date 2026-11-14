@@ -1,0 +1,46 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build (unsigned)
+        run: ./build.sh
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 聊天记录迁移-ipa
+          path: 聊天记录迁移.ipa
+
+      # Also publish the IPA to a dedicated `builds` branch so it can
+      # be fetched without the Actions UI: the raw IPA plus base64
+      # parts (60 KB each) and a sha256 manifest for verification.
+      - name: Publish IPA to builds branch
+        run: |
+          cp 聊天记录迁移.ipa /tmp/聊天记录迁移.ipa
+          shasum -a 256 /tmp/聊天记录迁移.ipa | awk '{print $1}' > /tmp/ipa.sha256
+          base64 -i /tmp/聊天记录迁移.ipa > /tmp/ipa.b64
+          split -b 60000 /tmp/ipa.b64 /tmp/ipa_part_
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B builds
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/聊天记录迁移.ipa .
+          cp /tmp/ipa.sha256 .
+          cp /tmp/ipa_part_* .
+          ls ipa_part_* | wc -l | tr -d ' ' > ipa_parts.count
+          git add 聊天记录迁移.ipa ipa.sha256 ipa_parts.count ipa_part_*
+          git commit -m "Build 聊天记录迁移.ipa"
+          git push origin builds --force
